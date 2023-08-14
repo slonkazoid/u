@@ -11,7 +11,7 @@ log = "0.4"
 env_logger = "0.10"
 glam = "0.24"
 fontdue = "0.7"
-etagere = "0.2"
+guillotiere = "0.6"
 shared = { path = "shared" }
 
 [build-dependencies]

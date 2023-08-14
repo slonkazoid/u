@@ -10,7 +10,7 @@ use log::LevelFilter;
 use glam::{Vec2, Vec3};
 use fontdue::{Font, FontSettings};
 use fontdue::layout::{Layout, CoordinateSystem, TextStyle};
-use etagere::{BucketedAtlasAllocator, Size};
+use guillotiere::{AtlasAllocator, Size};
 use shared::{Vertex, Consts};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -111,7 +111,7 @@ fn main() -> Result {
 
   let font_size = 48.0;
   let font = Font::from_bytes(include_bytes!("roboto.ttf") as &_, FontSettings::default())?;
-  let mut packer = BucketedAtlasAllocator::new(Size::new(256, 256));
+  let mut packer = AtlasAllocator::new(Size::new(256, 256));
   let mut tex_data = vec![[0; 4]; packer.size().area() as _];
   packer.allocate(Size::new(2, 2));
   tex_data[0] = [255; 4];
@@ -154,7 +154,6 @@ fn main() -> Result {
       (c, (min.to_array().into(), max.to_array().into()))
     })
     .collect();
-  packer.dump_svg(&mut std::fs::File::create("test.svg")?);
   let size = wgpu::Extent3d {
     width: packer.size().width as _,
     height: packer.size().height as _,

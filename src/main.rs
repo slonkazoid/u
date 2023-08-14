@@ -10,7 +10,7 @@ use log::LevelFilter;
 use glam::{Vec2, Vec3};
 use fontdue::{Font, FontSettings};
 use fontdue::layout::{Layout, CoordinateSystem, TextStyle};
-use etagere::{AtlasAllocator, Size};
+use etagere::{BucketedAtlasAllocator, Size};
 use shared::{Vertex, Consts};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -111,33 +111,53 @@ fn main() -> Result {
 
   let font_size = 48.0;
   let font = Font::from_bytes(include_bytes!("roboto.ttf") as &_, FontSettings::default())?;
-  let mut packer = AtlasAllocator::new(Size::new(2056, 2056));
-  let mut tex_data = vec![[0; 4]; 2056 * 2056];
-  packer.allocate(Size::new(1, 1));
+  let mut packer = BucketedAtlasAllocator::new(Size::new(256, 256));
+  let mut tex_data = vec![[0; 4]; packer.size().area() as _];
+  packer.allocate(Size::new(2, 2));
   tex_data[0] = [255; 4];
-  let glyphs: HashMap<_, _> = font
+  let glyphs: HashMap<_, (Vec2, Vec2)> = font
     .chars()
     .iter()
     .filter_map(|(c, i)| {
       let metrics = font.metrics_indexed(i.get(), font_size);
-      packer
-        .allocate(Size::new(metrics.width as _, metrics.height as _))
-        .map(|a| (c, (i, a.id)))
+      let size = Size::new(metrics.width as _, metrics.height as _);
+      if size.is_empty() {
+        None
+      } else {
+        Some(match packer.allocate(size) {
+          Some(a) => (c, (i, a)),
+          None => {
+            tex_data.extend(vec![[0; 4]; (packer.size().area() * 3) as _]);
+            packer.grow(packer.size() * 2);
+            match packer.allocate(size) {
+              Some(a) => (c, (i, a)),
+              None => panic!("its over"),
+            }
+          }
+        })
+      }
+    })
+    .collect::<HashMap<_, _>>()
+    .into_iter()
+    .map(|(c, (i, a))| {
+      let (metrics, raster) = font.rasterize_indexed(i.get(), font_size);
+      let pos = a.rectangle.min;
+      let width = packer.size().width as usize;
+      for y in 0..metrics.height {
+        for x in 0..metrics.width {
+          let px = raster[y * metrics.width + x];
+          tex_data[(y + pos.y as usize) * width + x + pos.x as usize] = [px, px, px, 255];
+        }
+      }
+      let min = pos.to_f32() / width as f32;
+      let max = (pos + Size::new(metrics.width as _, metrics.height as _)).to_f32() / width as f32;
+      (c, (min.to_array().into(), max.to_array().into()))
     })
     .collect();
-  for (_, (i, a)) in glyphs.iter() {
-    let a = packer.get(*a);
-    let (metrics, raster) = font.rasterize_indexed(i.get(), font_size);
-    for y in 0..metrics.height {
-      for x in 0..metrics.width {
-        let px = raster[y * metrics.width + x];
-        tex_data[(y + a.min.y as usize) * 2056 + x + a.min.x as usize] = [px, px, px, 255];
-      }
-    }
-  }
+  packer.dump_svg(&mut std::fs::File::create("test.svg")?);
   let size = wgpu::Extent3d {
-    width: 2056,
-    height: 2056,
+    width: packer.size().width as _,
+    height: packer.size().height as _,
     depth_or_array_layers: 1,
   };
   let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -191,10 +211,7 @@ fn main() -> Result {
   let mut indices = vec![];
 
   for g in layout.glyphs() {
-    if let Some((_, a)) = glyphs.get(&g.parent) {
-      let rect = packer.get(*a);
-      let min = rect.min.to_f32() / 2056.0;
-      let max = rect.max.to_f32() / 2056.0;
+    if let Some((min, max)) = glyphs.get(&g.parent) {
       indices.extend([0, 1, 2, 1, 3, 2].map(|l| l + verts.len() as u32));
       verts.extend([
         Vertex {

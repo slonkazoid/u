@@ -1,24 +1,26 @@
-#![feature(type_name_of_val)]
+mod ui;
+
 use std::{mem, slice};
-use std::collections::HashMap;
 use winit::window::WindowBuilder;
 use winit::event_loop::{EventLoop, ControlFlow};
 use winit::event::{Event, WindowEvent};
 use winit::dpi::PhysicalSize;
 use wgpu::util::DeviceExt;
 use log::LevelFilter;
-use glam::{Vec2, Vec3};
-use fontdue::{Font, FontSettings};
-use fontdue::layout::{Layout, CoordinateSystem, TextStyle};
-use guillotiere::{AtlasAllocator, Size};
+use glam::Vec2;
 use shared::{Vertex, Consts};
+use ui::Context;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 
 fn main() -> Result {
-  env_logger::builder().filter_level(LevelFilter::Info).init();
+  env_logger::builder()
+    .filter_level(LevelFilter::Info)
+    .filter(Some("wgpu_core"), LevelFilter::Warn)
+    .init();
+  std::panic::set_hook(Box::new(|i| log::error!("{}", i)));
   let event_loop = EventLoop::new();
   let window = WindowBuilder::new().build(&event_loop)?;
 
@@ -109,54 +111,11 @@ fn main() -> Result {
     ..Default::default()
   });
 
-  let font_size = 48.0;
-  let font = Font::from_bytes(include_bytes!("roboto.ttf") as &_, FontSettings::default())?;
-  let mut packer = AtlasAllocator::new(Size::new(256, 256));
-  let mut tex_data = vec![[0; 4]; packer.size().area() as _];
-  packer.allocate(Size::new(2, 2));
-  tex_data[0] = [255; 4];
-  let glyphs: HashMap<_, (Vec2, Vec2)> = font
-    .chars()
-    .iter()
-    .filter_map(|(c, i)| {
-      let metrics = font.metrics_indexed(i.get(), font_size);
-      let size = Size::new(metrics.width as _, metrics.height as _);
-      if size.is_empty() {
-        None
-      } else {
-        Some(match packer.allocate(size) {
-          Some(a) => (c, (i, a)),
-          None => {
-            tex_data.extend(vec![[0; 4]; (packer.size().area() * 3) as _]);
-            packer.grow(packer.size() * 2);
-            match packer.allocate(size) {
-              Some(a) => (c, (i, a)),
-              None => panic!("its over"),
-            }
-          }
-        })
-      }
-    })
-    .collect::<HashMap<_, _>>()
-    .into_iter()
-    .map(|(c, (i, a))| {
-      let (metrics, raster) = font.rasterize_indexed(i.get(), font_size);
-      let pos = a.rectangle.min;
-      let width = packer.size().width as usize;
-      for y in 0..metrics.height {
-        for x in 0..metrics.width {
-          let px = raster[y * metrics.width + x];
-          tex_data[(y + pos.y as usize) * width + x + pos.x as usize] = [px, px, px, 255];
-        }
-      }
-      let min = pos.to_f32() / width as f32;
-      let max = (pos + Size::new(metrics.width as _, metrics.height as _)).to_f32() / width as f32;
-      (c, (min.to_array().into(), max.to_array().into()))
-    })
-    .collect();
+  let mut ui = Context::new();
+  ui.fonts().add_font(include_bytes!("roboto.ttf"), 40.0)?;
   let size = wgpu::Extent3d {
-    width: packer.size().width as _,
-    height: packer.size().height as _,
+    width: ui.fonts().size().0,
+    height: ui.fonts().size().1,
     depth_or_array_layers: 1,
   };
   let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -177,7 +136,7 @@ fn main() -> Result {
       origin: wgpu::Origin3d::ZERO,
       aspect: wgpu::TextureAspect::All,
     },
-    cast_slice(&tex_data),
+    cast_slice(&ui.fonts().build_tex()),
     wgpu::ImageDataLayout {
       offset: 0,
       bytes_per_row: Some(4 * size.width),
@@ -200,73 +159,6 @@ fn main() -> Result {
     label: None,
   });
 
-  let mut layout = Layout::new(CoordinateSystem::PositiveYDown);
-  layout.append(
-    &[&font],
-    &TextStyle::new("the quick brown floppa", font_size, 0),
-  );
-
-  let mut verts = vec![];
-  let mut indices = vec![];
-
-  for g in layout.glyphs() {
-    if let Some((min, max)) = glyphs.get(&g.parent) {
-      indices.extend([0, 1, 2, 1, 3, 2].map(|l| l + verts.len() as u32));
-      verts.extend([
-        Vertex {
-          pos: Vec2::new(g.x, g.y),
-          uv: Vec2::new(min.x, min.y),
-          color: Vec3::ONE,
-        },
-        Vertex {
-          pos: Vec2::new(g.x + g.width as f32, g.y),
-          uv: Vec2::new(max.x, min.y),
-          color: Vec3::ONE,
-        },
-        Vertex {
-          pos: Vec2::new(g.x, g.y + g.height as f32),
-          uv: Vec2::new(min.x, max.y),
-          color: Vec3::ONE,
-        },
-        Vertex {
-          pos: Vec2::new(g.x + g.width as f32, g.y + g.height as f32),
-          uv: Vec2::new(max.x, max.y),
-          color: Vec3::ONE,
-        },
-      ]);
-    }
-  }
-
-  indices.extend([0, 1, 2].map(|l| l + verts.len() as u32));
-  verts.extend([
-    Vertex {
-      pos: Vec2::new(100.0, 100.0),
-      uv: Vec2::new(0.0, 0.0),
-      color: Vec3::X,
-    },
-    Vertex {
-      pos: Vec2::new(100.0, 200.0),
-      uv: Vec2::new(0.0, 0.0),
-      color: Vec3::Y,
-    },
-    Vertex {
-      pos: Vec2::new(200.0, 200.0),
-      uv: Vec2::new(0.0, 0.0),
-      color: Vec3::Z,
-    },
-  ]);
-
-  let vert_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-    contents: cast_slice(&verts),
-    usage: wgpu::BufferUsages::VERTEX,
-    label: None,
-  });
-  let idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-    contents: cast_slice(&indices),
-    usage: wgpu::BufferUsages::INDEX,
-    label: None,
-  });
-
   event_loop.run(move |event, _, control_flow| match event {
     Event::WindowEvent { event, .. } => match event {
       WindowEvent::Resized(size) => resize(&surface, &device, size),
@@ -279,6 +171,20 @@ fn main() -> Result {
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
       let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+      ui.begin_frame();
+      let out = ui.end_frame();
+
+      let vert_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        contents: cast_slice(&out.vtx_buf),
+        usage: wgpu::BufferUsages::VERTEX,
+        label: None,
+      });
+      let idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        contents: cast_slice(&out.idx_buf),
+        usage: wgpu::BufferUsages::INDEX,
+        label: None,
+      });
 
       let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -303,7 +209,7 @@ fn main() -> Result {
       render_pass.set_bind_group(0, &tex_bind_group, &[]);
       render_pass.set_vertex_buffer(0, vert_buf.slice(..));
       render_pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
-      render_pass.draw_indexed(0..indices.len() as _, 0, 0..1);
+      render_pass.draw_indexed(0..out.idx_buf.len() as _, 0, 0..1);
       drop(render_pass);
 
       queue.submit([encoder.finish()]);

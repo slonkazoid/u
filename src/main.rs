@@ -3,7 +3,7 @@ mod ui;
 use std::{mem, slice};
 use winit::window::WindowBuilder;
 use winit::event_loop::{EventLoop, ControlFlow};
-use winit::event::{Event, WindowEvent};
+use winit::event::{Event, WindowEvent, MouseButton, ElementState};
 use winit::dpi::PhysicalSize;
 use wgpu::util::DeviceExt;
 use log::LevelFilter;
@@ -91,7 +91,7 @@ fn main() -> Result {
       entry_point: "main_f",
       targets: &[Some(wgpu::ColorTargetState {
         format: FORMAT,
-        blend: Some(wgpu::BlendState::REPLACE),
+        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
         write_mask: wgpu::ColorWrites::ALL,
       })],
     }),
@@ -111,11 +111,11 @@ fn main() -> Result {
     ..Default::default()
   });
 
-  let mut ui = Context::new();
-  ui.fonts().add_font(include_bytes!("roboto.ttf"), 40.0)?;
+  let mut ctx = Context::new();
+  ctx.fonts().add_font(include_bytes!("roboto.ttf"), 18.0)?;
   let size = wgpu::Extent3d {
-    width: ui.fonts().size().0,
-    height: ui.fonts().size().1,
+    width: ctx.fonts().size().0,
+    height: ctx.fonts().size().1,
     depth_or_array_layers: 1,
   };
   let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -136,7 +136,7 @@ fn main() -> Result {
       origin: wgpu::Origin3d::ZERO,
       aspect: wgpu::TextureAspect::All,
     },
-    cast_slice(&ui.fonts().build_tex()),
+    cast_slice(&ctx.fonts().build_tex()),
     wgpu::ImageDataLayout {
       offset: 0,
       bytes_per_row: Some(4 * size.width),
@@ -159,64 +159,74 @@ fn main() -> Result {
     label: None,
   });
 
-  event_loop.run(move |event, _, control_flow| match event {
-    Event::WindowEvent { event, .. } => match event {
-      WindowEvent::Resized(size) => resize(&surface, &device, size),
-      WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+  event_loop.run(move |event, _, control_flow| {
+    handle_ui_event(&mut ctx, &event);
+    match event {
+      Event::WindowEvent { event, .. } => match event {
+        WindowEvent::Resized(size) => resize(&surface, &device, size),
+        WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+        _ => {}
+      },
+      Event::RedrawRequested(..) => {
+        let surface = surface.get_current_texture().unwrap();
+        let surface_view = surface
+          .texture
+          .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+        let mut ui = ctx.begin_frame();
+        ui.text("hello floppa");
+        ui.text("one");
+        ui.same_line();
+        ui.text("two");
+        if ui.button("button") {
+          log::info!("pressed");
+        }
+        let out = ctx.end_frame();
+
+        let vtx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+          contents: cast_slice(&out.vtx_buf),
+          usage: wgpu::BufferUsages::VERTEX,
+          label: None,
+        });
+        let idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+          contents: cast_slice(&out.idx_buf),
+          usage: wgpu::BufferUsages::INDEX,
+          label: None,
+        });
+
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+          color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &surface_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+              load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+              store: true,
+            },
+          })],
+          depth_stencil_attachment: None,
+          label: None,
+        });
+        render_pass.set_pipeline(&pipeline);
+        render_pass.set_push_constants(
+          wgpu::ShaderStages::VERTEX,
+          0,
+          cast(&Consts {
+            screen_size: Vec2::new(surface.texture.width() as _, surface.texture.height() as _),
+          }),
+        );
+        render_pass.set_bind_group(0, &tex_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, vtx_buf.slice(..));
+        render_pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
+        render_pass.draw_indexed(0..out.idx_buf.len() as _, 0, 0..1);
+        drop(render_pass);
+
+        queue.submit([encoder.finish()]);
+        surface.present();
+      }
+      Event::MainEventsCleared => window.request_redraw(),
       _ => {}
-    },
-    Event::RedrawRequested(..) => {
-      let surface = surface.get_current_texture().unwrap();
-      let surface_view = surface
-        .texture
-        .create_view(&wgpu::TextureViewDescriptor::default());
-      let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-
-      ui.begin_frame();
-      let out = ui.end_frame();
-
-      let vert_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        contents: cast_slice(&out.vtx_buf),
-        usage: wgpu::BufferUsages::VERTEX,
-        label: None,
-      });
-      let idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        contents: cast_slice(&out.idx_buf),
-        usage: wgpu::BufferUsages::INDEX,
-        label: None,
-      });
-
-      let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-          view: &surface_view,
-          resolve_target: None,
-          ops: wgpu::Operations {
-            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-            store: true,
-          },
-        })],
-        depth_stencil_attachment: None,
-        label: None,
-      });
-      render_pass.set_pipeline(&pipeline);
-      render_pass.set_push_constants(
-        wgpu::ShaderStages::VERTEX,
-        0,
-        cast(&Consts {
-          screen_size: Vec2::new(surface.texture.width() as _, surface.texture.height() as _),
-        }),
-      );
-      render_pass.set_bind_group(0, &tex_bind_group, &[]);
-      render_pass.set_vertex_buffer(0, vert_buf.slice(..));
-      render_pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
-      render_pass.draw_indexed(0..out.idx_buf.len() as _, 0, 0..1);
-      drop(render_pass);
-
-      queue.submit([encoder.finish()]);
-      surface.present();
     }
-    Event::MainEventsCleared => window.request_redraw(),
-    _ => {}
   });
 }
 
@@ -233,6 +243,27 @@ fn resize(surface: &wgpu::Surface, device: &wgpu::Device, size: PhysicalSize<u32
       view_formats: vec![],
     },
   );
+}
+
+fn handle_ui_event<T>(ctx: &mut Context, event: &Event<T>) {
+  let input = ctx.input();
+  match event {
+    Event::WindowEvent { event, .. } => match event {
+      WindowEvent::CursorMoved { position, .. } => {
+        input.cursor_pos = Vec2::new(position.x as _, position.y as _);
+      }
+      WindowEvent::MouseInput { button, state, .. } => {
+        input.mouse_buttons[match button {
+          MouseButton::Left => 0,
+          MouseButton::Middle => 2,
+          MouseButton::Right => 3,
+          _ => return,
+        }] = *state == ElementState::Pressed;
+      }
+      _ => {}
+    },
+    _ => {}
+  }
 }
 
 fn cast_slice<T>(t: &[T]) -> &[u8] {

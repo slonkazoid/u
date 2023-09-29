@@ -19,9 +19,10 @@ fn main() -> Result {
   env_logger::builder()
     .filter_level(LevelFilter::Info)
     .filter(Some("wgpu_core"), LevelFilter::Warn)
+    .filter(Some("wgpu_hal"), LevelFilter::Warn)
     .init();
   std::panic::set_hook(Box::new(|i| log::error!("{}", i)));
-  let event_loop = EventLoop::new();
+  let event_loop = EventLoop::new()?;
   let window = WindowBuilder::new().build(&event_loop)?;
 
   let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
@@ -45,7 +46,39 @@ fn main() -> Result {
   ))?;
   resize(&surface, &device, window.inner_size());
 
-  let shader = device.create_shader_module(wgpu::include_spirv!(env!("shaders.spv")));
+  let rt_shader = device.create_shader_module(wgpu::include_spirv!(env!("rt.spv")));
+  let rt_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+    label: None,
+    bind_group_layouts: &[],
+    push_constant_ranges: &[wgpu::PushConstantRange {
+      stages: wgpu::ShaderStages::FRAGMENT,
+      range: 0..mem::size_of::<Consts>() as _,
+    }],
+  });
+  let rt_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    layout: Some(&rt_pipeline_layout),
+    vertex: wgpu::VertexState {
+      module: &rt_shader,
+      entry_point: "main_v",
+      buffers: &[],
+    },
+    fragment: Some(wgpu::FragmentState {
+      module: &rt_shader,
+      entry_point: "main_f",
+      targets: &[Some(wgpu::ColorTargetState {
+        format: FORMAT,
+        blend: None,
+        write_mask: wgpu::ColorWrites::ALL,
+      })],
+    }),
+    primitive: wgpu::PrimitiveState::default(),
+    depth_stencil: None,
+    multisample: wgpu::MultisampleState::default(),
+    multiview: None,
+    label: None,
+  });
+
+  let ui_shader = device.create_shader_module(wgpu::include_spirv!(env!("shaders.spv")));
   let tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
     entries: &[
       wgpu::BindGroupLayoutEntry {
@@ -67,7 +100,7 @@ fn main() -> Result {
     ],
     label: None,
   });
-  let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+  let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
     label: None,
     bind_group_layouts: &[&tex_layout],
     push_constant_ranges: &[wgpu::PushConstantRange {
@@ -75,10 +108,10 @@ fn main() -> Result {
       range: 0..mem::size_of::<Consts>() as _,
     }],
   });
-  let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-    layout: Some(&pipeline_layout),
+  let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    layout: Some(&ui_pipeline_layout),
     vertex: wgpu::VertexState {
-      module: &shader,
+      module: &ui_shader,
       entry_point: "main_v",
       buffers: &[wgpu::VertexBufferLayout {
         array_stride: mem::size_of::<Vertex>() as _,
@@ -87,7 +120,7 @@ fn main() -> Result {
       }],
     },
     fragment: Some(wgpu::FragmentState {
-      module: &shader,
+      module: &ui_shader,
       entry_point: "main_f",
       targets: &[Some(wgpu::ColorTargetState {
         format: FORMAT,
@@ -159,75 +192,75 @@ fn main() -> Result {
     label: None,
   });
 
-  event_loop.run(move |event, _, control_flow| {
+  event_loop.run(move |event, elwt| {
     handle_ui_event(&mut ctx, &event);
     match event {
       Event::WindowEvent { event, .. } => match event {
         WindowEvent::Resized(size) => resize(&surface, &device, size),
-        WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+        WindowEvent::CloseRequested => elwt.exit(),
+        WindowEvent::RedrawRequested => {
+          let surface = surface.get_current_texture().unwrap();
+          let surface_view = surface
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+          let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+          let mut ui = ctx.begin_frame();
+          ui.text("hello floppa");
+          if ui.button("button") {
+            log::info!("pressed");
+          }
+          let out = ctx.end_frame();
+
+          let vtx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            contents: cast_slice(&out.vtx_buf),
+            usage: wgpu::BufferUsages::VERTEX,
+            label: None,
+          });
+          let idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            contents: cast_slice(&out.idx_buf),
+            usage: wgpu::BufferUsages::INDEX,
+            label: None,
+          });
+
+          let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+              view: &surface_view,
+              resolve_target: None,
+              ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: true,
+              },
+            })],
+            depth_stencil_attachment: None,
+            label: None,
+          });
+          let consts = Consts {
+            screen_size: Vec2::new(surface.texture.width() as _, surface.texture.height() as _),
+          };
+          render_pass.set_pipeline(&rt_pipeline);
+          render_pass.set_push_constants(wgpu::ShaderStages::FRAGMENT, 0, cast(&consts));
+          render_pass.draw(0..3, 0..1);
+
+          render_pass.set_pipeline(&ui_pipeline);
+          render_pass.set_push_constants(wgpu::ShaderStages::VERTEX, 0, cast(&consts));
+          render_pass.set_bind_group(0, &tex_bind_group, &[]);
+          render_pass.set_vertex_buffer(0, vtx_buf.slice(..));
+          render_pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
+          render_pass.draw_indexed(0..out.idx_buf.len() as _, 0, 0..1);
+          drop(render_pass);
+
+          queue.submit([encoder.finish()]);
+          surface.present();
+        }
         _ => {}
       },
-      Event::RedrawRequested(..) => {
-        let surface = surface.get_current_texture().unwrap();
-        let surface_view = surface
-          .texture
-          .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-
-        let mut ui = ctx.begin_frame();
-        ui.text("hello floppa");
-        ui.text("one");
-        ui.same_line();
-        ui.text("two");
-        if ui.button("button") {
-          log::info!("pressed");
-        }
-        let out = ctx.end_frame();
-
-        let vtx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-          contents: cast_slice(&out.vtx_buf),
-          usage: wgpu::BufferUsages::VERTEX,
-          label: None,
-        });
-        let idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-          contents: cast_slice(&out.idx_buf),
-          usage: wgpu::BufferUsages::INDEX,
-          label: None,
-        });
-
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-          color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: &surface_view,
-            resolve_target: None,
-            ops: wgpu::Operations {
-              load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-              store: true,
-            },
-          })],
-          depth_stencil_attachment: None,
-          label: None,
-        });
-        render_pass.set_pipeline(&pipeline);
-        render_pass.set_push_constants(
-          wgpu::ShaderStages::VERTEX,
-          0,
-          cast(&Consts {
-            screen_size: Vec2::new(surface.texture.width() as _, surface.texture.height() as _),
-          }),
-        );
-        render_pass.set_bind_group(0, &tex_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, vtx_buf.slice(..));
-        render_pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
-        render_pass.draw_indexed(0..out.idx_buf.len() as _, 0, 0..1);
-        drop(render_pass);
-
-        queue.submit([encoder.finish()]);
-        surface.present();
-      }
-      Event::MainEventsCleared => window.request_redraw(),
+      Event::AboutToWait => window.request_redraw(),
       _ => {}
     }
-  });
+  })?;
+  Ok(())
 }
 
 fn resize(surface: &wgpu::Surface, device: &wgpu::Device, size: PhysicalSize<u32>) {

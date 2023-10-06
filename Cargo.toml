@@ -10,8 +10,7 @@ pollster = "0.3"
 log = "0.4"
 env_logger = "0.10"
 glam = "0.24"
-fontdue = "0.7"
-guillotiere = "0.6"
+rand = "0.8"
 shared = { path = "shared" }
 
 [build-dependencies]

@@ -34,12 +34,10 @@ impl Ray {
   }
 }
 
-#[derive(Copy, Clone)]
 struct Sphere {
   pos: Vec3,
   radius: f32,
-  color: Vec3,
-  mat: Material,
+  mat: usize,
 }
 
 impl Sphere {
@@ -69,7 +67,64 @@ impl Sphere {
       pos,
       normal: if front_face { normal } else { -normal },
       front_face,
+      mat: self.mat,
     }
+  }
+}
+
+struct Mesh {
+  start: usize,
+  end: usize,
+  aabb: AABB,
+  mat: usize,
+}
+
+#[derive(Copy, Clone, Default)]
+pub struct Tri(Vec3, Vec3, Vec3, usize);
+
+impl Tri {
+  fn hit(&self, ray: &Ray, min: f32, max: f32) -> Hit {
+    let ab = self.1 - self.0;
+    let ac = self.2 - self.0;
+    let ao = ray.origin - self.0;
+    let u_vec = ray.dir.cross(ac);
+    let det = ab.dot(u_vec);
+    let inv_det = 1.0 / det;
+    let u = ao.dot(u_vec) * inv_det;
+    if u < 0.0 || u > 1.0 {
+      return Hit::default();
+    }
+    let v_vec = ao.cross(ab);
+    let v = ray.dir.dot(v_vec) * inv_det;
+    if v < 0.0 || u + v > 1.0 {
+      return Hit::default();
+    }
+    let distance = ac.dot(v_vec) * inv_det;
+    if distance > min && distance < max {
+      Hit {
+        distance,
+        pos: ray.at(distance),
+        normal: ab.cross(ac).normalize(),
+        front_face: det > 0.0,
+        mat: self.3,
+      }
+    } else {
+      Hit::default()
+    }
+  }
+}
+
+pub struct AABB(Vec3, Vec3);
+
+impl AABB {
+  fn hit(&self, ray: &Ray) -> bool {
+    let min = (self.0 - ray.origin) / ray.dir;
+    let tmax = (self.1 - ray.origin) / ray.dir;
+    let t1 = min.min(tmax);
+    let t2 = min.max(tmax);
+    let near = t1.x.max(t1.y).max(t1.z);
+    let far = t2.x.min(t2.y).min(t2.z);
+    near < far
   }
 }
 
@@ -88,6 +143,7 @@ struct Hit {
   pos: Vec3,
   normal: Vec3,
   front_face: bool,
+  mat: usize,
 }
 
 struct Camera {
@@ -118,91 +174,108 @@ pub fn main_f(
   uv: Vec2,
   #[spirv(frag_coord)] frag_coord: Vec4,
   #[spirv(push_constant)] consts: &Consts,
-  #[spirv(descriptor_set = 0, binding = 0)] tex: &Image2d,
-  #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
+  #[spirv(descriptor_set = 0, binding = 0)] sampler: &Sampler,
+  #[spirv(descriptor_set = 1, binding = 0)] prev: &Image2d,
+  #[spirv(descriptor_set = 2, binding = 0)] sky: &Image2d,
+  #[spirv(storage_buffer, descriptor_set = 3, binding = 0)] vtx_buf: &mut [Vec4],
   out_color: &mut Vec4,
 ) {
   let coord = Vec2::new(frag_coord.x, frag_coord.y);
   let mut rng = Rng(uv * consts.rand);
   let mut cam = Camera::new(Vec3::new(0.0, 1.5, 0.0), coord, consts.screen_size);
-  let objects = [
+  let materials = [
+    (Vec3::splat(0.8), Material::Lambertian),
+    (Vec3::X, Material::Lambertian),
+    (Vec3::Y, Material::Lambertian),
+    (Vec3::Z, Material::Lambertian),
+    (Vec3::new(1.0, 0.0, 1.0), Material::Lambertian),
+    (Vec3::ONE, Material::Dielectric),
+    (Vec3::splat(0.8), Material::Metal),
+  ];
+  let spheres = [
     Sphere {
       pos: Vec3::new(0.0, -200.0, 0.0),
       radius: 200.0,
-      color: Vec3::splat(0.8),
-      mat: Material::Lambertian,
+      mat: 0,
     },
     Sphere {
       pos: Vec3::new(-3.0, 1.5, -7.5),
       radius: 1.5,
-      color: Vec3::X,
-      mat: Material::Lambertian,
+      mat: 1,
     },
     Sphere {
       pos: Vec3::new(0.0, 1.5, -10.0),
       radius: 1.5,
-      color: Vec3::Y,
-      mat: Material::Lambertian,
+      mat: 2,
     },
     Sphere {
       pos: Vec3::new(3.0, 1.5, -7.5),
       radius: 1.5,
-      color: Vec3::Z,
-      mat: Material::Lambertian,
+      mat: 3,
     },
     Sphere {
       pos: Vec3::new(0.0, 1.5, 2.5),
       radius: 1.5,
-      color: Vec3::new(1.0, 0.0, 1.0),
-      mat: Material::Lambertian,
+      mat: 4,
     },
     Sphere {
-      pos: Vec3::new(1.0, 1.0, -3.0),
+      pos: Vec3::new(1.5, 1.0, -3.0),
       radius: 0.75,
-      color: Vec3::ONE,
-      mat: Material::Dielectric,
+      mat: 5,
     },
     Sphere {
-      pos: Vec3::new(-1.0, 1.0, -3.0),
+      pos: Vec3::new(-1.5, 1.0, -3.0),
       radius: 0.75,
-      color: Vec3::splat(0.8),
-      mat: Material::Metal,
-    },
-    Sphere {
-      pos: Vec3::new(8.0, 8.0, -8.0),
-      radius: 4.0,
-      color: Vec3::splat(5.0),
-      mat: Material::Emissive,
+      mat: 6,
     },
   ];
+  let meshes = [Mesh {
+    start: 0,
+    end: 2903,
+    aabb: AABB(
+      Vec3::new(-1.040056, 0.026624, -6.060498),
+      Vec3::new(1.442725, 1.795877, -4.065464),
+    ),
+    mat: 0,
+  }];
 
-  *out_color = tex.sample(*sampler, Vec2::new(uv.x, 1.0 - uv.y));
+  *out_color = prev.sample_by_lod(*sampler, Vec2::new(uv.x, 1.0 - uv.y), 1.0);
   let mut attenuation = Vec3::ONE;
   let mut ray = cam.ray(&mut rng);
   for _ in 0..MAX_BOUNCES {
     let mut closest = Hit::default();
-    let mut obj = 0;
-    for i in 0..objects.len() {
-      let hit = objects[i].hit(
-        &ray,
-        0.001,
-        if closest.distance == 0.0 {
-          f32::MAX
-        } else {
-          closest.distance
-        },
-      );
+    closest.distance = f32::MAX;
+    let mut obj = (0, 0);
+    for i in 0..spheres.len() {
+      let hit = spheres[i].hit(&ray, 0.001, closest.distance);
       if hit.distance > 0.0 {
         closest = hit;
-        obj = i;
       }
     }
-    if closest.distance > 0.0 {
-      ray = match objects[obj].mat {
+    for i in 0..meshes.len() {
+      if meshes[i].aabb.hit(&ray) {
+        for f in meshes[i].start..meshes[i].end / 3 {
+          let hit = Tri(
+            vtx_buf[3 * f].truncate(),
+            vtx_buf[3 * f + 1].truncate(),
+            vtx_buf[3 * f + 2].truncate(),
+            meshes[i].mat,
+          )
+          .hit(&ray, 0.001, closest.distance);
+          if hit.distance > 0.0 {
+            closest = hit;
+          }
+        }
+      }
+    }
+
+    if closest.distance != f32::MAX {
+      let (color, mat) = materials[closest.mat];
+      ray = match mat {
         Material::Lambertian => Ray::new(closest.pos, closest.normal + rng.gen_in_sphere()),
         Material::Metal => Ray::new(closest.pos, reflect(ray.dir, closest.normal)),
         Material::Emissive => {
-          *out_color += (objects[obj].color * attenuation).extend(1.0);
+          *out_color += (color * attenuation).extend(1.0);
           break;
         }
         Material::Dielectric => {
@@ -221,14 +294,20 @@ pub fn main_f(
           Ray::new(closest.pos, dir)
         }
       };
-      attenuation *= objects[obj].color;
+      attenuation *= color;
     } else {
-      // let sky = Vec3::new(0.25, 0.35, 0.5);
-      let sky = Vec3::splat(0.01);
-      *out_color += (sky * attenuation).extend(1.0);
+      *out_color +=
+        sky.sample_by_lod(*sampler, to_equirect(ray.dir), 1.0) * attenuation.extend(1.0);
       break;
     }
   }
+}
+
+fn to_equirect(mut dir: Vec3) -> Vec2 {
+  dir = Vec3::new(dir.x, dir.z, dir.y);
+  let mut longlat = Vec2::new(dir.y.atan2(dir.x), dir.z.acos());
+  longlat.x += PI;
+  return longlat / Vec2::new(2.0 * PI, PI);
 }
 
 fn unreal(x: Vec3) -> Vec3 {
@@ -239,8 +318,8 @@ fn unreal(x: Vec3) -> Vec3 {
 pub fn quad_f(
   uv: Vec2,
   #[spirv(push_constant)] consts: &Consts,
-  #[spirv(descriptor_set = 0, binding = 0)] tex: &Image2d,
-  #[spirv(descriptor_set = 0, binding = 1)] sampler: &Sampler,
+  #[spirv(descriptor_set = 0, binding = 0)] sampler: &Sampler,
+  #[spirv(descriptor_set = 1, binding = 0)] tex: &Image2d,
   out_color: &mut Vec4,
 ) {
   *out_color =

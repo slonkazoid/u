@@ -1,15 +1,21 @@
-#![feature(array_chunks)]
+mod ui;
+
 use std::{mem, slice};
+use std::io::BufReader;
+use std::fs::File;
 use winit::window::WindowBuilder;
 use winit::event_loop::EventLoop;
-use winit::event::{Event, WindowEvent};
+use winit::event::{Event, WindowEvent, MouseButton, ElementState};
 use wgpu::util::DeviceExt;
 use log::LevelFilter;
 use glam::{Vec2, Vec3};
 use obj::{load_obj, Obj};
-use shared::Consts;
+use shared::{Consts, Vertex, Material};
+use crate::ui::Context;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+const SAMPLES: u32 = 4096;
 
 fn main() -> Result {
   env_logger::builder()
@@ -31,9 +37,9 @@ fn main() -> Result {
   .unwrap();
   let (device, queue) = pollster::block_on(adapter.request_device(
     &wgpu::DeviceDescriptor {
-      features: wgpu::Features::PUSH_CONSTANTS,
+      features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
       limits: wgpu::Limits {
-        max_push_constant_size: 128,
+        max_bind_groups: 8,
         ..Default::default()
       },
       label: None,
@@ -41,96 +47,12 @@ fn main() -> Result {
     None,
   ))?;
 
-  let shader = device.create_shader_module(wgpu::include_spirv!(env!("rt.spv")));
-  let sampler_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-    entries: &[wgpu::BindGroupLayoutEntry {
-      binding: 0,
-      visibility: wgpu::ShaderStages::FRAGMENT,
-      ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-      count: None,
-    }],
-    label: None,
-  });
-  let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
-  let sampler_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-    layout: &sampler_layout,
-    entries: &[wgpu::BindGroupEntry {
-      binding: 0,
-      resource: wgpu::BindingResource::Sampler(&sampler),
-    }],
-    label: None,
-  });
-  let tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-    entries: &[wgpu::BindGroupLayoutEntry {
-      binding: 0,
-      visibility: wgpu::ShaderStages::FRAGMENT,
-      ty: wgpu::BindingType::Texture {
-        multisampled: false,
-        view_dimension: wgpu::TextureViewDimension::D2,
-        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-      },
-      count: None,
-    }],
-    label: None,
-  });
-  let buffer_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-    label: None,
-    entries: &[wgpu::BindGroupLayoutEntry {
-      binding: 0,
-      count: None,
-      visibility: wgpu::ShaderStages::FRAGMENT,
-      ty: wgpu::BindingType::Buffer {
-        has_dynamic_offset: false,
-        min_binding_size: None,
-        ty: wgpu::BufferBindingType::Storage { read_only: false },
-      },
-    }],
-  });
-
-  let obj: Obj = load_obj(std::io::BufReader::new(std::fs::File::open(
-    "untitled.obj",
-  )?))?;
-  let mut min = Vec3::MAX;
-  let mut max = Vec3::MIN;
-  let vtx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-    contents: cast_slice(
-      &obj
-        .indices
-        .iter()
-        .map(|i| {
-          let pos = Vec3::from(obj.vertices[*i as usize].position);
-          min = min.min(pos);
-          max = max.max(pos);
-          pos.extend(1.0)
-        })
-        .collect::<Vec<_>>(),
-    ),
-    usage: wgpu::BufferUsages::STORAGE,
-    label: None,
-  });
-  log::info!("{} {}", min, max);
-  let vtx_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-    layout: &buffer_layout,
-    entries: &[wgpu::BindGroupEntry {
-      binding: 0,
-      resource: vtx_buf.as_entire_binding(),
-    }],
-    label: None,
-  });
-
-  let rt_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-    label: None,
-    bind_group_layouts: &[&sampler_layout, &tex_layout, &tex_layout, &buffer_layout],
-    push_constant_ranges: &[wgpu::PushConstantRange {
-      stages: wgpu::ShaderStages::FRAGMENT,
-      range: 0..mem::size_of::<Consts>() as _,
-    }],
-  });
+  let shader = device.create_shader_module(wgpu::include_spirv!(env!("shaders.spv")));
   let rt_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-    layout: Some(&rt_pipeline_layout),
+    layout: None,
     vertex: wgpu::VertexState {
       module: &shader,
-      entry_point: "main_v",
+      entry_point: "quad_v",
       buffers: &[],
     },
     fragment: Some(wgpu::FragmentState {
@@ -148,20 +70,11 @@ fn main() -> Result {
     multiview: None,
     label: None,
   });
-
-  let quad_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-    label: None,
-    bind_group_layouts: &[&sampler_layout, &tex_layout],
-    push_constant_ranges: &[wgpu::PushConstantRange {
-      stages: wgpu::ShaderStages::FRAGMENT,
-      range: 0..mem::size_of::<Consts>() as _,
-    }],
-  });
   let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-    layout: Some(&quad_pipeline_layout),
+    layout: None,
     vertex: wgpu::VertexState {
       module: &shader,
-      entry_point: "main_v",
+      entry_point: "quad_v",
       buffers: &[],
     },
     fragment: Some(wgpu::FragmentState {
@@ -179,17 +92,111 @@ fn main() -> Result {
     multiview: None,
     label: None,
   });
+  let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    layout: None,
+    vertex: wgpu::VertexState {
+      module: &shader,
+      entry_point: "ui_v",
+      buffers: &[wgpu::VertexBufferLayout {
+        array_stride: mem::size_of::<Vertex>() as _,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x3],
+      }],
+    },
+    fragment: Some(wgpu::FragmentState {
+      module: &shader,
+      entry_point: "ui_f",
+      targets: &[Some(wgpu::ColorTargetState {
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+        write_mask: wgpu::ColorWrites::ALL,
+      })],
+    }),
+    primitive: wgpu::PrimitiveState::default(),
+    depth_stencil: None,
+    multisample: wgpu::MultisampleState::default(),
+    multiview: None,
+    label: None,
+  });
+  let tex_layout = rt_pipeline.get_bind_group_layout(2);
 
-  let size = window.inner_size();
-  let mut textures = Textures::new(&device, &tex_layout, size.width, size.height);
-  let mut consts = Consts {
-    screen_size: Vec2::new(size.width as _, size.height as _),
-    rand: rand::random(),
-    samples: 0,
-  };
+  let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+    size: mem::size_of::<Consts>() as _,
+    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    mapped_at_creation: false,
+    label: None,
+  });
+  let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    layout: &rt_pipeline.get_bind_group_layout(0),
+    entries: &[wgpu::BindGroupEntry {
+      binding: 0,
+      resource: uniform_buf.as_entire_binding(),
+    }],
+    label: None,
+  });
+
+  let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+  let sampler_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    layout: &rt_pipeline.get_bind_group_layout(1),
+    entries: &[wgpu::BindGroupEntry {
+      binding: 0,
+      resource: wgpu::BindingResource::Sampler(&sampler),
+    }],
+    label: None,
+  });
+
+  let obj: Obj = load_obj(BufReader::new(File::open("untitled.obj")?))?;
+  let mut min = Vec3::MAX;
+  let mut max = Vec3::MIN;
+  let verts = obj
+    .indices
+    .iter()
+    .map(|i| {
+      let pos = Vec3::from(obj.vertices[*i as usize].position);
+      min = min.min(pos);
+      max = max.max(pos);
+      pos.extend(1.0)
+    })
+    .collect::<Vec<_>>();
+  let vtx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    contents: cast_slice(&verts),
+    usage: wgpu::BufferUsages::STORAGE,
+    label: None,
+  });
+  log::info!("{} {} {}", min, max, verts.len());
+  let materials = [
+    (Vec3::splat(0.8), Material::Lambertian),
+    (Vec3::X, Material::Lambertian),
+    (Vec3::Y, Material::Lambertian),
+    (Vec3::Z, Material::Lambertian),
+    (Vec3::new(1.0, 0.0, 1.0), Material::Lambertian),
+    (Vec3::ONE, Material::Dielectric),
+    (Vec3::splat(0.8), Material::Metal),
+    (Vec3::splat(5.0), Material::Emissive),
+  ];
+  let material_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    contents: cast_slice(&materials),
+    usage: wgpu::BufferUsages::STORAGE,
+    label: None,
+  });
+  let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    layout: &rt_pipeline.get_bind_group_layout(4),
+    entries: &[
+      wgpu::BindGroupEntry {
+        binding: 0,
+        resource: vtx_buf.as_entire_binding(),
+      },
+      wgpu::BindGroupEntry {
+        binding: 1,
+        resource: material_buf.as_entire_binding(),
+      },
+    ],
+    label: None,
+  });
 
   let sky = image::open("alps_field_4k.exr")?.to_rgba32f();
   let sky_tex = device.create_texture_with_data(
+    // let sky_tex = device.create_texture(
     &queue,
     &wgpu::TextureDescriptor {
       size: wgpu::Extent3d {
@@ -217,41 +224,120 @@ fn main() -> Result {
     label: None,
   });
 
-  event_loop.run(move |event, elwt| match event {
-    Event::WindowEvent { event, .. } => match event {
-      WindowEvent::Resized(size) => {
-        surface.configure(
-          &device,
-          &wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: wgpu::TextureFormat::Bgra8Unorm,
-            width: size.width,
-            height: size.height,
-            present_mode: wgpu::PresentMode::Immediate,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            view_formats: vec![],
-          },
-        );
-        textures = Textures::new(&device, &tex_layout, size.width, size.height);
-        consts.screen_size = Vec2::new(size.width as _, size.height as _);
-        consts.samples = 0;
-      }
-      WindowEvent::CloseRequested => elwt.exit(),
-      WindowEvent::RedrawRequested => {
-        let surface = surface.get_current_texture().unwrap();
-        let surface_view = surface
-          .texture
-          .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+  let mut ctx = Context::new();
+  ctx.fonts().add_font(include_bytes!("roboto.ttf"), 40.0)?;
+  let font_tex = device.create_texture_with_data(
+    &queue,
+    &wgpu::TextureDescriptor {
+      size: wgpu::Extent3d {
+        width: ctx.fonts().size().0,
+        height: ctx.fonts().size().1,
+        depth_or_array_layers: 1,
+      },
+      mip_level_count: 1,
+      sample_count: 1,
+      dimension: wgpu::TextureDimension::D2,
+      format: wgpu::TextureFormat::Rgba8Unorm,
+      usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+      view_formats: &[],
+      label: None,
+    },
+    cast_slice(&ctx.fonts().build_tex()),
+  );
+  let font_view = font_tex.create_view(&wgpu::TextureViewDescriptor::default());
+  let font_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    layout: &tex_layout,
+    entries: &[wgpu::BindGroupEntry {
+      binding: 0,
+      resource: wgpu::BindingResource::TextureView(&font_view),
+    }],
+    label: None,
+  });
 
-        if consts.samples < 1024 {
-          consts.rand = rand::random();
-          consts.samples += 1;
-          log::info!("{}", consts.samples);
+  let size = window.inner_size();
+  let mut textures = Textures::new(&device, &tex_layout, size.width, size.height);
+  let mut consts = Consts {
+    size: Vec2::new(size.width as _, size.height as _),
+    rand: rand::random(),
+    samples: 1,
+    zero: 0.0,
+  };
 
-          let mut rt_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+  event_loop.run(move |event, elwt| {
+    handle_ui_event(&mut ctx, &event);
+    match event {
+      Event::WindowEvent { event, .. } => match event {
+        WindowEvent::Resized(size) => {
+          surface.configure(
+            &device,
+            &wgpu::SurfaceConfiguration {
+              usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+              format: wgpu::TextureFormat::Bgra8Unorm,
+              width: size.width,
+              height: size.height,
+              present_mode: wgpu::PresentMode::Immediate,
+              alpha_mode: wgpu::CompositeAlphaMode::Auto,
+              view_formats: vec![],
+            },
+          );
+          textures = Textures::new(&device, &tex_layout, size.width, size.height);
+          consts.size = Vec2::new(size.width as _, size.height as _);
+          consts.samples = 1;
+        }
+        WindowEvent::CloseRequested => elwt.exit(),
+        WindowEvent::RedrawRequested => {
+          let surface = surface.get_current_texture().unwrap();
+          let surface_view = surface
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+          let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+          queue.write_buffer(&uniform_buf, 0, cast(&consts));
+
+          if consts.samples <= SAMPLES {
+            let mut rt_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+              color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &textures.current_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                  load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                  store: true,
+                },
+              })],
+              depth_stencil_attachment: None,
+              label: None,
+            });
+            rt_pass.set_pipeline(&rt_pipeline);
+            rt_pass.set_bind_group(0, &uniform_bind_group, &[]);
+            rt_pass.set_bind_group(1, &sampler_bind_group, &[]);
+            rt_pass.set_bind_group(2, &textures.prev_bind_group, &[]);
+            rt_pass.set_bind_group(3, &sky_bind_group, &[]);
+            rt_pass.set_bind_group(4, &scene_bind_group, &[]);
+            rt_pass.draw(0..3, 0..1);
+            drop(rt_pass);
+            encoder.copy_texture_to_texture(
+              wgpu::ImageCopyTexture {
+                texture: &textures.current,
+                mip_level: 0,
+                origin: wgpu::Origin3d::default(),
+                aspect: wgpu::TextureAspect::All,
+              },
+              wgpu::ImageCopyTexture {
+                texture: &textures.prev,
+                mip_level: 0,
+                origin: wgpu::Origin3d::default(),
+                aspect: wgpu::TextureAspect::All,
+              },
+              textures.prev.size(),
+            );
+            consts.rand = rand::random();
+            consts.samples += 1;
+          }
+
+          let mut quad_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-              view: &textures.current_view,
+              view: &surface_view,
               resolve_target: None,
               ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -261,57 +347,57 @@ fn main() -> Result {
             depth_stencil_attachment: None,
             label: None,
           });
-          rt_pass.set_pipeline(&rt_pipeline);
-          rt_pass.set_bind_group(0, &sampler_bind_group, &[]);
-          rt_pass.set_bind_group(1, &textures.prev_bind_group, &[]);
-          rt_pass.set_bind_group(2, &sky_bind_group, &[]);
-          rt_pass.set_bind_group(3, &vtx_bind_group, &[]);
-          rt_pass.set_push_constants(wgpu::ShaderStages::FRAGMENT, 0, cast(&consts));
-          rt_pass.draw(0..3, 0..1);
-          drop(rt_pass);
-          encoder.copy_texture_to_texture(
-            wgpu::ImageCopyTexture {
-              texture: &textures.current,
-              mip_level: 0,
-              origin: wgpu::Origin3d::default(),
-              aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::ImageCopyTexture {
-              texture: &textures.prev,
-              mip_level: 0,
-              origin: wgpu::Origin3d::default(),
-              aspect: wgpu::TextureAspect::All,
-            },
-            textures.prev.size(),
-          );
+          quad_pass.set_pipeline(&quad_pipeline);
+          quad_pass.set_bind_group(0, &uniform_bind_group, &[]);
+          quad_pass.set_bind_group(1, &sampler_bind_group, &[]);
+          quad_pass.set_bind_group(2, &textures.prev_bind_group, &[]);
+          quad_pass.draw(0..3, 0..1);
+          drop(quad_pass);
+
+          let mut ui = ctx.begin_frame();
+          ui.text(&format!("{}/{}", consts.samples - 1, SAMPLES));
+          let out = ctx.end_frame();
+          let vtx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            contents: cast_slice(&out.vtx_buf),
+            usage: wgpu::BufferUsages::VERTEX,
+            label: None,
+          });
+          let idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            contents: cast_slice(&out.idx_buf),
+            usage: wgpu::BufferUsages::INDEX,
+            label: None,
+          });
+          let mut ui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+              view: &surface_view,
+              resolve_target: None,
+              ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: true,
+              },
+            })],
+            depth_stencil_attachment: None,
+            label: None,
+          });
+          ui_pass.set_pipeline(&ui_pipeline);
+          ui_pass.set_bind_group(0, &uniform_bind_group, &[]);
+          ui_pass.set_bind_group(1, &sampler_bind_group, &[]);
+          ui_pass.set_bind_group(2, &font_bind_group, &[]);
+          ui_pass.set_vertex_buffer(0, vtx_buf.slice(..));
+          ui_pass.set_index_buffer(idx_buf.slice(..), wgpu::IndexFormat::Uint32);
+          ui_pass.draw_indexed(0..out.idx_buf.len() as _, 0, 0..1);
+          drop(ui_pass);
+
+          queue.submit([encoder.finish()]);
+          surface.present();
+          instance.poll_all(true);
         }
+        _ => {}
+      },
+      Event::AboutToWait => window.request_redraw(),
 
-        let mut quad_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-          color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: &surface_view,
-            resolve_target: None,
-            ops: wgpu::Operations {
-              load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-              store: true,
-            },
-          })],
-          depth_stencil_attachment: None,
-          label: None,
-        });
-        quad_pass.set_pipeline(&quad_pipeline);
-        quad_pass.set_bind_group(0, &sampler_bind_group, &[]);
-        quad_pass.set_bind_group(1, &textures.prev_bind_group, &[]);
-        quad_pass.set_push_constants(wgpu::ShaderStages::FRAGMENT, 0, cast(&consts));
-        quad_pass.draw(0..3, 0..1);
-        drop(quad_pass);
-
-        queue.submit([encoder.finish()]);
-        surface.present();
-      }
       _ => {}
-    },
-    Event::AboutToWait => window.request_redraw(),
-    _ => {}
+    }
   })?;
   Ok(())
 }
@@ -379,4 +465,25 @@ fn cast_slice<T>(t: &[T]) -> &[u8] {
 
 fn cast<T>(t: &T) -> &[u8] {
   cast_slice(slice::from_ref(t))
+}
+
+fn handle_ui_event<T>(ctx: &mut Context, event: &Event<T>) {
+  let input = ctx.input();
+  match event {
+    Event::WindowEvent { event, .. } => match event {
+      WindowEvent::CursorMoved { position, .. } => {
+        input.cursor_pos = Vec2::new(position.x as _, position.y as _);
+      }
+      WindowEvent::MouseInput { button, state, .. } => {
+        input.mouse_buttons[match button {
+          MouseButton::Left => 0,
+          MouseButton::Middle => 2,
+          MouseButton::Right => 3,
+          _ => return,
+        }] = *state == ElementState::Pressed;
+      }
+      _ => {}
+    },
+    _ => {}
+  }
 }

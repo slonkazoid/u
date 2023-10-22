@@ -13,6 +13,8 @@ glam = "0.24"
 rand = "0.8"
 image = "0.24"
 obj-rs = "0.7"
+fontdue = "0.7"
+guillotiere = "0.6"
 shared = { path = "shared" }
 
 [build-dependencies]

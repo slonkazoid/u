@@ -1,19 +1,22 @@
 #![no_std]
+#![feature(unchecked_math)]
+use core::mem;
 use core::f32::consts::PI;
 use spirv_std::{spirv, Sampler};
 use spirv_std::image::Image2d;
 use spirv_std::glam::{Vec2, Vec3, Vec4};
 use spirv_std::num_traits::Float;
-use shared::Consts;
+use shared::{Consts, Material};
 
 #[spirv(vertex)]
-pub fn main_v(
+pub fn quad_v(
   #[spirv(vertex_index)] idx: u32,
+  #[spirv(uniform, descriptor_set = 0, binding = 0)] consts: &Consts,
   out_uv: &mut Vec2,
   #[spirv(position)] out_pos: &mut Vec4,
 ) {
   *out_uv = Vec2::new(((idx << 1) & 2) as f32, (idx & 2) as f32);
-  *out_pos = (2.0 * *out_uv - Vec2::ONE).extend(0.0).extend(1.0);
+  *out_pos = (2.0 * *out_uv - Vec2::ONE).extend(consts.zero).extend(1.0);
 }
 
 struct Ray {
@@ -100,12 +103,14 @@ impl Tri {
       return Hit::default();
     }
     let distance = ac.dot(v_vec) * inv_det;
+    let normal = ab.cross(ac).normalize();
+    let front_face = ray.dir.dot(normal) < 0.0;
     if distance > min && distance < max {
       Hit {
         distance,
         pos: ray.at(distance),
-        normal: ab.cross(ac).normalize(),
-        front_face: det > 0.0,
+        normal: if front_face { normal } else { -normal },
+        front_face,
         mat: self.3,
       }
     } else {
@@ -128,15 +133,6 @@ impl AABB {
   }
 }
 
-#[repr(u32)]
-#[derive(Copy, Clone)]
-enum Material {
-  Lambertian,
-  Metal,
-  Emissive,
-  Dielectric,
-}
-
 #[derive(Default)]
 struct Hit {
   distance: f32,
@@ -150,48 +146,63 @@ struct Camera {
   pos: Vec3,
   coord: Vec2,
   size: Vec2,
+  fov: f32,
+  defocus: f32,
+  focal_length: f32,
 }
 
 impl Camera {
   fn new(pos: Vec3, coord: Vec2, size: Vec2) -> Self {
-    Self { pos, coord, size }
+    Self {
+      pos,
+      coord,
+      size,
+      fov: 0.6,
+      defocus: 0.05,
+      focal_length: 5.0,
+    }
   }
 
   fn ray(&mut self, rng: &mut Rng) -> Ray {
     let relative =
       Vec2::new(self.coord.x + rng.gen(), self.coord.y + rng.gen()) * 2.0 / self.size - Vec2::ONE;
-    Ray::new(
-      self.pos,
-      -(relative * Vec2::new(self.size.x / self.size.y, 1.0) * 0.6f32.tan()).extend(1.0),
-    )
+    let dir = -(relative * Vec2::new(self.size.x / self.size.y, 1.0) * self.fov.tan()).extend(1.0);
+    let start = self.pos + (self.defocus * rng.gen_in_circle()).extend(0.0);
+    let target = self.pos + dir * self.focal_length;
+    Ray::new(start, target - start)
   }
 }
 
 const MAX_BOUNCES: usize = 32;
 
+fn hash(key: u32) -> u32 {
+  let mut h = 0;
+  for i in 0..4 {
+    h += (key >> (i * 8)) & 0xFF;
+    h += h << 10;
+    h ^= h >> 6;
+  }
+  h += h << 3;
+  h ^= h >> 11;
+  h += h << 15;
+  h
+}
+
 #[spirv(fragment)]
 pub fn main_f(
   uv: Vec2,
   #[spirv(frag_coord)] frag_coord: Vec4,
-  #[spirv(push_constant)] consts: &Consts,
-  #[spirv(descriptor_set = 0, binding = 0)] sampler: &Sampler,
-  #[spirv(descriptor_set = 1, binding = 0)] prev: &Image2d,
-  #[spirv(descriptor_set = 2, binding = 0)] sky: &Image2d,
-  #[spirv(storage_buffer, descriptor_set = 3, binding = 0)] vtx_buf: &mut [Vec4],
+  #[spirv(uniform, descriptor_set = 0, binding = 0)] consts: &Consts,
+  #[spirv(descriptor_set = 1, binding = 0)] sampler: &Sampler,
+  #[spirv(descriptor_set = 2, binding = 0)] prev: &Image2d,
+  #[spirv(descriptor_set = 3, binding = 0)] sky: &Image2d,
+  #[spirv(storage_buffer, descriptor_set = 4, binding = 0)] vtx_buf: &mut [Vec4],
+  #[spirv(storage_buffer, descriptor_set = 4, binding = 1)] materials: &mut [Vec4],
   out_color: &mut Vec4,
 ) {
   let coord = Vec2::new(frag_coord.x, frag_coord.y);
-  let mut rng = Rng(uv * consts.rand);
-  let mut cam = Camera::new(Vec3::new(0.0, 1.5, 0.0), coord, consts.screen_size);
-  let materials = [
-    (Vec3::splat(0.8), Material::Lambertian),
-    (Vec3::X, Material::Lambertian),
-    (Vec3::Y, Material::Lambertian),
-    (Vec3::Z, Material::Lambertian),
-    (Vec3::new(1.0, 0.0, 1.0), Material::Lambertian),
-    (Vec3::ONE, Material::Dielectric),
-    (Vec3::splat(0.8), Material::Metal),
-  ];
+  let mut rng = Rng(consts.rand ^ hash((coord.x + consts.size.y * coord.y) as _));
+  let mut cam = Camera::new(Vec3::new(0.0, 1.5, 0.0), coord, consts.size);
   let spheres = [
     Sphere {
       pos: Vec3::new(0.0, -200.0, 0.0),
@@ -228,10 +239,15 @@ pub fn main_f(
       radius: 0.75,
       mat: 6,
     },
+    // Sphere {
+    //   pos: Vec3::new(6.0, 6.0, 6.0),
+    //   radius: 4.0,
+    //   mat: 7,
+    // },
   ];
   let meshes = [Mesh {
     start: 0,
-    end: 2903,
+    end: 2901,
     aabb: AABB(
       Vec3::new(-1.040056, 0.026624, -6.060498),
       Vec3::new(1.442725, 1.795877, -4.065464),
@@ -240,12 +256,28 @@ pub fn main_f(
   }];
 
   *out_color = prev.sample_by_lod(*sampler, Vec2::new(uv.x, 1.0 - uv.y), 1.0);
-  let mut attenuation = Vec3::ONE;
+
+  let wavelength = rng.gen_pos() * 370.0 + 380.0;
+  let mut attenuation = match wavelength {
+    380.0..=440.0 => {
+      let at = 0.3 + 0.7 * (wavelength - 380.0) / (440.0 - 380.0);
+      Vec3::new((-(wavelength - 440.0) / (440.0 - 380.0)) * at, 0.0, at)
+    }
+    440.0..=490.0 => Vec3::new(0.0, (wavelength - 440.0) / (490.0 - 440.0), 1.0),
+    510.0..=580.0 => Vec3::new((wavelength - 510.0) / (580.0 - 510.0), 1.0, 0.0),
+    580.0..=645.0 => Vec3::new(1.0, -(wavelength - 645.0) / (645.0 - 580.0), 0.0),
+    645.0..=750.0 => {
+      let at = 0.3 + 0.7 * (750.0 - wavelength) / (750.0 - 645.0);
+      Vec3::new(at, 0.0, 0.0)
+    }
+    _ => Vec3::ZERO,
+  };
+  attenuation *= Vec3::new(2.74738275, 2.97417918, 3.33566826); //?
+
   let mut ray = cam.ray(&mut rng);
   for _ in 0..MAX_BOUNCES {
     let mut closest = Hit::default();
     closest.distance = f32::MAX;
-    let mut obj = (0, 0);
     for i in 0..spheres.len() {
       let hit = spheres[i].hit(&ray, 0.001, closest.distance);
       if hit.distance > 0.0 {
@@ -270,8 +302,9 @@ pub fn main_f(
     }
 
     if closest.distance != f32::MAX {
-      let (color, mat) = materials[closest.mat];
-      ray = match mat {
+      let mat = materials[closest.mat];
+      let color = mat.truncate();
+      ray = match mat.w.into() {
         Material::Lambertian => Ray::new(closest.pos, closest.normal + rng.gen_in_sphere()),
         Material::Metal => Ray::new(closest.pos, reflect(ray.dir, closest.normal)),
         Material::Emissive => {
@@ -279,7 +312,8 @@ pub fn main_f(
           break;
         }
         Material::Dielectric => {
-          let ir = if closest.front_face { 1.0 / 1.5 } else { 1.5 };
+          let ir = 1.5 + (wavelength - 150.0) * 0.0005;
+          let ir = if closest.front_face { 1.0 / ir } else { ir };
           let cos_theta = (-ray.dir).dot(closest.normal).min(1.0);
           let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
 
@@ -303,11 +337,8 @@ pub fn main_f(
   }
 }
 
-fn to_equirect(mut dir: Vec3) -> Vec2 {
-  dir = Vec3::new(dir.x, dir.z, dir.y);
-  let mut longlat = Vec2::new(dir.y.atan2(dir.x), dir.z.acos());
-  longlat.x += PI;
-  return longlat / Vec2::new(2.0 * PI, PI);
+fn to_equirect(dir: Vec3) -> Vec2 {
+  Vec2::new(dir.z.atan2(dir.x) + PI, dir.y.acos()) / Vec2::new(2.0 * PI, PI)
 }
 
 fn unreal(x: Vec3) -> Vec3 {
@@ -317,9 +348,9 @@ fn unreal(x: Vec3) -> Vec3 {
 #[spirv(fragment)]
 pub fn quad_f(
   uv: Vec2,
-  #[spirv(push_constant)] consts: &Consts,
-  #[spirv(descriptor_set = 0, binding = 0)] sampler: &Sampler,
-  #[spirv(descriptor_set = 1, binding = 0)] tex: &Image2d,
+  #[spirv(uniform, descriptor_set = 0, binding = 0)] consts: &Consts,
+  #[spirv(descriptor_set = 1, binding = 0)] sampler: &Sampler,
+  #[spirv(descriptor_set = 2, binding = 0)] tex: &Image2d,
   out_color: &mut Vec4,
 ) {
   *out_color =
@@ -327,20 +358,22 @@ pub fn quad_f(
       .extend(1.0);
 }
 
-struct Rng(Vec2);
+struct Rng(u32);
 
 impl Rng {
   fn gen(&mut self) -> f32 {
-    let res = (self.0.dot(Vec2::new(12.9898, 78.233)).sin() * 43758.5453).fract();
-    self.0 = Vec2::new(
-      (self.0.x + res + 17.825) % 3718.0,
-      (self.0.y + res + 72.7859) % 1739.0,
-    );
-    res
+    self.0 = unsafe { self.0.unchecked_mul(0xadb4a92d) } + 1;
+    let m = (self.0 >> 9) | 0x40000000;
+    unsafe { mem::transmute::<_, f32>(m) - 3.0 }
   }
 
   fn gen_pos(&mut self) -> f32 {
     (self.gen() + 1.0) / 2.0
+  }
+
+  fn gen_in_circle(&mut self) -> Vec2 {
+    let t = PI * self.gen();
+    self.gen_pos().sqrt() * Vec2::new(t.cos(), t.sin())
   }
 
   fn gen_in_sphere(&mut self) -> Vec3 {
@@ -366,4 +399,37 @@ fn refract(v: Vec3, n: Vec3, ir: f32) -> Vec3 {
 fn schlick(cos: f32, ir: f32) -> f32 {
   let r0 = ((1.0 - ir) / (1.0 + ir)).powf(2.0);
   r0 + (1.0 - r0) * (1.0 - cos).powf(5.0)
+}
+
+#[spirv(vertex)]
+pub fn ui_v(
+  pos: Vec2,
+  uv: Vec2,
+  color: Vec3,
+  #[spirv(uniform, descriptor_set = 0, binding = 0)] consts: &Consts,
+  #[spirv(position)] out_pos: &mut Vec4,
+  out_uv: &mut Vec2,
+  out_color: &mut Vec3,
+) {
+  *out_pos = Vec4::new(
+    2.0 * pos.x / consts.size.x - 1.0,
+    1.0 - 2.0 * pos.y / consts.size.y,
+    0.0,
+    1.0,
+  );
+  *out_uv = uv;
+  *out_color = color;
+}
+
+#[spirv(fragment)]
+pub fn ui_f(
+  uv: Vec2,
+  color: Vec3,
+  #[spirv(uniform, descriptor_set = 0, binding = 0)] consts: &Consts,
+  #[spirv(descriptor_set = 1, binding = 0)] sampler: &Sampler,
+  #[spirv(descriptor_set = 2, binding = 0)] tex: &Image2d,
+  out_color: &mut Vec4,
+) {
+  // maybe needs gamma correction?
+  *out_color = tex.sample(*sampler, uv) * color.extend(consts.zero + 1.0);
 }
